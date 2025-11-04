@@ -20,9 +20,8 @@ spring:
         - id: user-service
           uri: http://localhost:8081
           predicates:
-            - Path=api/users/**
+            - Path=/api/user/**
           filters:
-            - StripPrefix=1
             - AuthenticationFilter
             - LoggingFilter
 
@@ -36,4 +35,5 @@ jwt:
 logging:
   level:
     com.example.gateway: DEBUG
-    org.springframework.cloud.gateway: DEBUG
+    org.springframework.cloud.gateway: DEBUG  # ← Set to TRACE temporarily
+    org.springframework.web.server: DEBUG
