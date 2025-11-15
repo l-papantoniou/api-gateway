@@ -50,6 +50,13 @@ This API Gateway acts as a single entry point for all client requests to backend
 - **Request ID Propagation**: Unique request ID for distributed tracing
 - **Customizable Log Prefixes**: Service-specific log identification
 
+### 🚦 Rate Limiting
+- **Token Bucket Algorithm**: Configurable request limits with automatic token refill
+- **Distributed Rate Limiting**: Redis-based storage works across multiple gateway instances
+- **Multiple Strategies**: Rate limit per user, IP address, API key, or globally
+- **Informative Headers**: Returns rate limit status in response headers
+- **Graceful Handling**: Returns 429 with retry information when limit exceeded
+
 ### ⚡ Performance
 - **Reactive & Non-Blocking**: Built on Spring WebFlux for high throughput
 - **Async Request Processing**: Handles thousands of concurrent connections
@@ -57,7 +64,7 @@ This API Gateway acts as a single entry point for all client requests to backend
 
 ---
 
-## 🏗️ Architecture
+## 🗏️ Architecture
 ```
 ┌─────────────┐
 │   Clients   │
@@ -70,22 +77,28 @@ This API Gateway acts as a single entry point for all client requests to backend
 ┌──────────────────────────────────────┐
 │         API Gateway (Port 8080)      │
 │                                      │
-│  ┌────────────────────────────────┐ │
-│  │  1. Authentication Filter      │ │
-│  │     - Validates JWT token      │ │
-│  │     - Extracts user info       │ │
-│  └────────────────────────────────┘ │
+│  ┌────────────────────────────────┐  │
+│  │  1. Authentication Filter      │  │
+│  │     - Validates JWT token      │  │
+│  │     - Extracts user info       │  │
+│  └────────────────────────────────┘  │
 │              ↓                       │
-│  ┌────────────────────────────────┐ │
-│  │  2. Logging Filter             │ │
-│  │     - Logs request/response    │ │
-│  │     - Tracks duration          │ │
-│  └────────────────────────────────┘ │
+│  ┌────────────────────────────────┐  │
+│  │  2. Rate Limiting Filter       │  │
+│  │     - Checks request limit     │  │
+│  │     - Token bucket algorithm   │  │
+│  └────────────────────────────────┘  │
 │              ↓                       │
-│  ┌────────────────────────────────┐ │
-│  │  3. Route to Microservice      │ │
-│  │     - Forwards with headers    │ │
-│  └────────────────────────────────┘ │
+│  ┌────────────────────────────────┐  │
+│  │  3. Logging Filter             │  │
+│  │     - Logs request/response    │  │
+│  │     - Tracks duration          │  │
+│  └────────────────────────────────┘  │
+│              ↓                       │
+│  ┌────────────────────────────────┐  │
+│  │  4. Route to Microservice      │  │
+│  │     - Forwards with headers    │  │
+│  └────────────────────────────────┘  │
 └──────────────┬───────────────────────┘
                │
        ┌───────┴────────┐
@@ -108,11 +121,13 @@ This API Gateway acts as a single entry point for all client requests to backend
 2. **Authentication Filter** validates token using public key from Authorization Server
 3. **Authentication Filter** extracts user claims (ID, role, email) from token
 4. **Authentication Filter** adds user info as HTTP headers
-5. **Logging Filter** logs request details
-6. **Gateway** routes to appropriate microservice
-7. **Microservice** processes request using user context from headers
-8. **Logging Filter** logs response with duration
-9. **Gateway** returns response to client
+5. **Rate Limiting Filter** checks if user/IP is within rate limit
+6. **Rate Limiting Filter** consumes token from bucket or returns 429 if exceeded
+7. **Logging Filter** logs request details
+8. **Gateway** routes to appropriate microservice
+9. **Microservice** processes request using user context from headers
+10. **Logging Filter** logs response with duration
+11. **Gateway** returns response to client
 
 ---
 
@@ -126,10 +141,11 @@ This API Gateway acts as a single entry point for all client requests to backend
 | Spring WebFlux | 6.x | Reactive Web Framework |
 | JJWT | 0.12.5 | JWT Parsing & Validation |
 | Nimbus JOSE JWT | 9.37.3 | JWKS Parsing |
+| Bucket4j | 8.7.0 | Rate Limiting (Token Bucket) |
+| Redis | 7.x | Distributed Rate Limit Storage |
 | Project Reactor | 3.6.x | Reactive Programming |
 | Lombok | 1.18.x | Boilerplate Reduction |
 | Maven | 3.9+ | Build Tool |
-
 ---
 
 ## 📋 Prerequisites
@@ -138,6 +154,7 @@ Before running the API Gateway, ensure you have:
 
 - **Java 17 or higher** installed
 - **Maven 3.9+** for building the project
+- **Redis** running on port 6379 (for rate limiting)
 - **Spring Authorization Server** running on port 9000 (or configured port)
 - **Backend Microservices** running (User Service, Order Service, etc.)
 
@@ -159,16 +176,25 @@ git clone https://github.com/your-username/api-gateway.git
 cd api-gateway
 ```
 
-### 2. Build the Project
+### 2. Start Redis
+```bash
+docker run -d -p 6379:6379 --name redis redis:alpine
+```
+
+Or using Docker Compose (see `docker-compose.yml`):
+```bash
+docker-compose up -d
+```
+
+### 3. Build the Project
 ```bash
 mvn clean install
 ```
 
-### 3. Run the Application
+### 4. Run the Application
 ```bash
 mvn spring-boot:run
 ```
-
 
 ## 🚀 Usage
 
@@ -262,6 +288,16 @@ The gateway returns structured JSON error responses:
 }
 ```
 
+**429 Too Many Requests - Rate Limit Exceeded:**
+```json
+{
+  "error": "Rate limit exceeded",
+  "message": "Too many requests. Please try again in 60 seconds.",
+  "status": 429,
+  "timestamp": "2025-11-04T14:30:00.191199Z"
+}
+```
+
 ### Health Check
 
 Check gateway health:
@@ -286,6 +322,103 @@ curl http://localhost:8080/actuator/gateway/routes
 ---
 
 
+---
+
+## 🛡️ Rate Limiting
+
+The gateway implements **distributed rate limiting** using the Token Bucket algorithm with Redis.
+
+### How It Works
+```
+Request → Identify User/IP → Check Token Bucket in Redis → Allow or Deny
+```
+
+Each user gets a "bucket" of tokens. Each request consumes 1 token. Tokens automatically refill over time.
+
+### Configuration
+
+**Global settings (application.yml):**
+```yaml
+rate-limit:
+  enabled: true
+  default-capacity: 100          # Max tokens in bucket
+  default-refill-tokens: 100     # Tokens to add on refill
+  default-refill-duration: 60    # Refill every 60 seconds
+```
+
+**Per-route settings:**
+```yaml
+spring:
+  cloud:
+    gateway:
+      routes:
+        - id: user-service
+          uri: http://localhost:8081
+          predicates:
+            - Path=/api/user/**
+          filters:
+            - AuthenticationFilter
+            - name: RateLimitingFilter
+              args:
+                keyStrategy: USER      # USER, IP, API_KEY, or GLOBAL
+                capacity: 50           # 50 requests max
+                refillTokens: 50       # Add 50 tokens
+                refillDuration: 60     # Every 60 seconds
+            - LoggingFilter
+```
+
+### Rate Limit Strategies
+
+| Strategy | Description | Example Key |
+|----------|-------------|-------------|
+| **USER** | Per authenticated user (from JWT) | `user:123` |
+| **IP** | Per client IP address | `ip:192.168.1.1` |
+| **API_KEY** | Per API key header | `api-key:abc123` |
+| **GLOBAL** | All requests share same bucket | `global` |
+
+### Response Headers
+
+**Normal response:**
+```http
+HTTP/1.1 200 OK
+X-RateLimit-Limit: 50             # Max requests allowed
+X-RateLimit-Remaining: 45         # Requests remaining
+X-RateLimit-Reset: 1730734920000  # Reset timestamp (Unix ms)
+```
+
+**Rate limit exceeded:**
+```http
+HTTP/1.1 429 Too Many Requests
+X-RateLimit-Limit: 50
+X-RateLimit-Remaining: 0
+Retry-After: 60                   # Seconds to wait
+
+{
+  "error": "Rate limit exceeded",
+  "message": "Too many requests. Please try again in 60 seconds.",
+  "status": 429,
+  "timestamp": "2025-11-04T14:30:00.191199Z"
+}
+```
+
+
+### Configuration Examples
+
+**Burst and sustained rate:**
+```yaml
+capacity: 100          # Can burst 100 requests immediately
+refillTokens: 100      # Then limited to 100 requests
+refillDuration: 60     # Per minute (sustained rate)
+```
+
+**Strict rate (no burst):**
+```yaml
+capacity: 10           # Max 10 requests at once
+refillTokens: 10       # Add 10 tokens
+refillDuration: 1      # Every second = 10 req/sec
+```
+
+
 ## 📁 Project Structure
 ```
 api-gateway/
@@ -295,11 +428,16 @@ api-gateway/
 │   │   │   └── com/example/api_gateway/
 │   │   │       ├── ApiGatewayApplication.java      # Main application
 │   │   │       ├── config/
-│   │   │       │   └── JwtProperties.java          # JWT configuration properties
-│   │   │       ├── util/
-│   │   │       │   └── JwtUtil.java                # JWT validation utility
+│   │   │       │   ├── JwtProperties.java          # JWT configuration
+│   │   │       │   ├── RateLimitProperties.java    # Rate limit config
+│   │   │       │   └── RedisConfig.java            # Redis connection
+│   │   │       ├── service/
+│   │   │       │   ├── JwtUtil.java                # JWT validation
+│   │   │       │   └── RateLimiterService.java     # Rate limiting logic
 │   │   │       ├── filter/
-│   │   │       │   ├── AuthenticationFilter.java   # JWT authentication filter
+│   │   │       │   ├── RequestIdFilter.java        # Request ID generation
+│   │   │       │   ├── AuthenticationFilter.java   # JWT authentication
+│   │   │       │   ├── RateLimitingFilter.java     # Rate limiting
 │   │   │       │   └── LoggingFilter.java          # Request/response logging
 │   │   │       └── exception/
 │   │   │           └── GlobalExceptionHandler.java # Global error handling
@@ -311,6 +449,7 @@ api-gateway/
 │       └── java/
 │           └── com/example/api_gateway/
 │               └── ApiGatewayApplicationTests.java
+├── docker-compose.yml                              # Docker services (Redis)
 ├── pom.xml                                         # Maven dependencies
 ├── README.md                                       # This file
 └── .gitignore
@@ -345,5 +484,29 @@ Route-specific filter that:
 - Supports custom log prefixes per route
 - Tracks request performance
 
+
+#### `RateLimitProperties.java`
+Configuration class for rate limiting settings (capacity, refill tokens, refill duration).
+
+#### `RedisConfig.java`
+Redis client configuration for distributed rate limiting storage.
+
+#### `RateLimiterService.java`
+Core rate limiting service:
+- Implements Token Bucket algorithm using Bucket4j
+- Manages token buckets in Redis for distributed rate limiting
+- Provides token consumption and availability checking
+
+#### `RequestIdFilter.java`
+Global filter that generates unique request IDs for distributed tracing.
+
+#### `RateLimitingFilter.java`
+Gateway filter that:
+- Checks rate limits before forwarding requests
+- Supports multiple key strategies (user, IP, API key, global)
+- Returns 429 error with retry information when limit exceeded
+- Adds rate limit headers to responses
 ---
+
+
 
